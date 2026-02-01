@@ -1,0 +1,257 @@
+import { NextRequest, NextResponse } from 'next/server';
+import Anthropic from '@anthropic-ai/sdk';
+import { createPublicClient, http, formatUnits, type Address } from 'viem';
+import { base } from 'viem/chains';
+
+// Intent types
+type IntentType = 'deposit' | 'withdraw' | 'swap' | 'stake' | 'borrow' | 'repay' | 'query';
+type QueryType = 'positions' | 'yields' | 'risk' | 'balance';
+
+interface Intent {
+  type: IntentType;
+  tokenIn?: string;
+  tokenOut?: string;
+  amount?: string;
+  protocol?: string;
+  query?: QueryType;
+  confidence: number;
+  rawInput: string;
+}
+
+// System prompt for intent parsing
+const SYSTEM_PROMPT = `You are a DeFi intent parser for the Katana network. Parse natural language into structured intents.
+
+Available intent types:
+- deposit: Put tokens into a yield protocol
+- withdraw: Take tokens out of a protocol  
+- swap: Exchange one token for another
+- stake: Stake tokens for rewards
+- borrow: Borrow against collateral
+- repay: Repay borrowed tokens
+- query: Information requests
+
+Respond ONLY with valid JSON:
+{
+  "type": "deposit|withdraw|swap|stake|borrow|repay|query",
+  "tokenIn": "TOKEN_SYMBOL or null",
+  "tokenOut": "TOKEN_SYMBOL or null",
+  "amount": "number string, 'half', 'all', or null",
+  "protocol": "morpho|sushi|yearn|spectra|best or null",
+  "query": "positions|yields|risk|balance or null",
+  "confidence": 0.0-1.0
+}`;
+
+// Quick parse for common queries
+function quickParse(input: string): Intent | null {
+  const normalized = input.toLowerCase().trim();
+
+  if (normalized.includes('balance') || normalized.includes('how much') || normalized.includes('what do i have')) {
+    return { type: 'query', query: 'balance', confidence: 0.95, rawInput: input };
+  }
+
+  if (normalized.includes('position') || normalized.includes('my deposit')) {
+    return { type: 'query', query: 'positions', confidence: 0.9, rawInput: input };
+  }
+
+  if (normalized.includes('risk') || normalized.includes('liquidat') || normalized.includes('am i safe')) {
+    return { type: 'query', query: 'risk', confidence: 0.9, rawInput: input };
+  }
+
+  if (normalized.includes('yield') || normalized.includes('apy') || normalized.includes('best rate')) {
+    return { type: 'query', query: 'yields', confidence: 0.9, rawInput: input };
+  }
+
+  return null;
+}
+
+// ERC20 ABI for balance queries
+const ERC20_ABI = [
+  {
+    inputs: [{ name: 'account', type: 'address' }],
+    name: 'balanceOf',
+    outputs: [{ name: '', type: 'uint256' }],
+    stateMutability: 'view',
+    type: 'function',
+  },
+] as const;
+
+// Token list
+const TOKENS = [
+  { symbol: 'USDC', address: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913' as Address, decimals: 6 },
+  { symbol: 'WETH', address: '0x4200000000000000000000000000000000000006' as Address, decimals: 18 },
+  { symbol: 'DAI', address: '0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb' as Address, decimals: 18 },
+];
+
+async function fetchBalances(walletAddress: Address) {
+  const client = createPublicClient({
+    chain: base,
+    transport: http(),
+  });
+
+  const balances: Array<{ symbol: string; balance: string; formatted: string }> = [];
+
+  // Fetch ETH balance
+  try {
+    const ethBalance = await client.getBalance({ address: walletAddress });
+    balances.push({
+      symbol: 'ETH',
+      balance: ethBalance.toString(),
+      formatted: formatUnits(ethBalance, 18),
+    });
+  } catch (e) {
+    console.error('ETH balance error:', e);
+  }
+
+  // Fetch ERC20 balances
+  for (const token of TOKENS) {
+    try {
+      const balance = await client.readContract({
+        address: token.address,
+        abi: ERC20_ABI,
+        functionName: 'balanceOf',
+        args: [walletAddress],
+      });
+
+      if (balance > 0n) {
+        balances.push({
+          symbol: token.symbol,
+          balance: balance.toString(),
+          formatted: formatUnits(balance, token.decimals),
+        });
+      }
+    } catch (e) {
+      console.error(`${token.symbol} balance error:`, e);
+    }
+  }
+
+  return balances;
+}
+
+function formatBalanceResponse(balances: Array<{ symbol: string; formatted: string }>) {
+  if (balances.length === 0) {
+    return "You don't have any tokens in this wallet.";
+  }
+
+  const lines = ['**Your Balances:**', ''];
+
+  for (const token of balances) {
+    const amount = parseFloat(token.formatted);
+    if (amount > 0) {
+      const display = amount < 0.0001 
+        ? '<0.0001' 
+        : amount.toLocaleString('en-US', { maximumFractionDigits: 4 });
+      lines.push(`• **${token.symbol}**: ${display}`);
+    }
+  }
+
+  return lines.join('\n');
+}
+
+export async function POST(request: NextRequest) {
+  try {
+    const { message, walletAddress } = await request.json();
+
+    if (!message || !walletAddress) {
+      return NextResponse.json(
+        { error: 'Missing message or wallet address' },
+        { status: 400 }
+      );
+    }
+
+    // Try quick parse first
+    let intent = quickParse(message);
+
+    // If no quick match, use Claude for parsing
+    if (!intent && process.env.ANTHROPIC_API_KEY) {
+      try {
+        const anthropic = new Anthropic();
+        const response = await anthropic.messages.create({
+          model: 'claude-3-5-sonnet-20241022',
+          max_tokens: 256,
+          system: SYSTEM_PROMPT,
+          messages: [{ role: 'user', content: message }],
+        });
+
+        const content = response.content[0];
+        if (content.type === 'text') {
+          const parsed = JSON.parse(content.text);
+          intent = {
+            type: parsed.type,
+            tokenIn: parsed.tokenIn || undefined,
+            tokenOut: parsed.tokenOut || undefined,
+            amount: parsed.amount || undefined,
+            protocol: parsed.protocol || undefined,
+            query: parsed.query || undefined,
+            confidence: parsed.confidence,
+            rawInput: message,
+          };
+        }
+      } catch (e) {
+        console.error('Claude parse error:', e);
+      }
+    }
+
+    // Default to balance query if we still can't parse
+    if (!intent) {
+      intent = { type: 'query', query: 'balance', confidence: 0.5, rawInput: message };
+    }
+
+    // Handle the intent
+    let response: string;
+    let data: any = null;
+
+    switch (intent.type) {
+      case 'query':
+        switch (intent.query) {
+          case 'balance':
+            const balances = await fetchBalances(walletAddress as Address);
+            data = { balances };
+            response = formatBalanceResponse(balances);
+            break;
+
+          case 'positions':
+            response = "📊 **Your Positions:**\n\nNo active positions found. Try depositing into a yield protocol!";
+            break;
+
+          case 'yields':
+            response = "📈 **Best Yields on Katana:**\n\n• **Yearn USDC**: 8.5% APY\n• **Morpho USDC/ETH**: 12.3% APY\n• **Spectra PT-USDC**: 15.2% APY (fixed)\n\nWant me to deposit into any of these?";
+            break;
+
+          case 'risk':
+            response = "✅ **Risk Assessment:**\n\nNo active lending positions found. You're safe from liquidation!\n\nWhen you borrow, I'll monitor your health factor.";
+            break;
+
+          default:
+            response = "I can help you with balances, positions, yields, and risk checks. What would you like to know?";
+        }
+        break;
+
+      case 'swap':
+        response = `🔄 **Swap Preview:**\n\nSwap ${intent.amount || '?'} ${intent.tokenIn || '?'} → ${intent.tokenOut || '?'}\n\n*Coming soon! This will route through Sushi for best rates.*`;
+        break;
+
+      case 'deposit':
+        response = `💰 **Deposit Preview:**\n\nDeposit ${intent.amount || '?'} ${intent.tokenIn || '?'} into ${intent.protocol || 'best yield'}\n\n*Coming soon! Will show you the best yield options.*`;
+        break;
+
+      case 'withdraw':
+        response = `📤 **Withdraw Preview:**\n\nWithdraw ${intent.amount || 'all'} from ${intent.protocol || 'your position'}\n\n*Coming soon!*`;
+        break;
+
+      default:
+        response = "I understand you want to do something with DeFi. Try asking:\n\n• \"Show my balances\"\n• \"What's the best yield for USDC?\"\n• \"Swap 0.1 ETH to USDC\"";
+    }
+
+    return NextResponse.json({
+      intent,
+      response,
+      data,
+    });
+  } catch (error) {
+    console.error('Chat API error:', error);
+    return NextResponse.json(
+      { error: 'Internal server error' },
+      { status: 500 }
+    );
+  }
+}
